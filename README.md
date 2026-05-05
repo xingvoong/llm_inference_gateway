@@ -1,383 +1,180 @@
 # LLM Inference Gateway
 
-A FastAPI service that routes prompts to different LLM providers using rule-based logic, and logs every request for future ML training.
+A FastAPI service that routes prompts to different LLM providers using rule-based and ML-based logic. Every request is logged to SQLite — that log is the training data for the next version of the router.
 
-Not every prompt needs GPT-4. This gateway picks the right model based on priority, prompt length, and cost — then logs every decision as training data for a future learned router.
-
-**Current state:** Providers are mocked — no API keys or credits needed. The `OpenRouterProvider` is built and ready (`app/providers/openrouter_provider.py`) but not wired in. To use real models, add an `OPENROUTER_API_KEY` to `.env` and swap the providers in `router.py`.
+Not every prompt needs GPT-4. This gateway picks the right model based on priority, cost, and what the prompt is actually asking for.
 
 ---
 
-## System Architecture
+## What This Is
 
-The structure stays the same across all phases. What evolves is what happens inside each box.
+A from-scratch inference gateway built in 5 phases. Starts with `if/else` rules, ends with a trained ML classifier making routing decisions. Built entirely free — providers are mocked, no API keys needed.
 
-```
-  Client
-    │
-    │  POST /chat { prompt, priority, max_cost }
-    ▼
-┌──────────────────────────────────────────────────────────┐
-│                      LLM Gateway                          │
-│                                                           │
-│   ┌──────────┐      ┌──────────┐      ┌───────────────┐  │
-│   │  FastAPI  │─────►│  Router  │─────►│   Provider    │  │
-│   │  /chat   │      └──────────┘      │               │  │
-│   └──────────┘                        │  OpenAI       │  │
-│                                       │  HuggingFace  │  │
-│                                       └───────┬───────┘  │
-│                                               │           │
-│                                       ┌───────▼───────┐  │
-│                                       │    Logger     │  │
-│                                       │   (SQLite)    │  │
-│                                       └───────────────┘  │
-└──────────────────────────────────────────────────────────┘
-         │                                      │
-         ▼                                      ▼
-    OpenAI API                        HuggingFace API
-    (GPT-4, GPT-3.5)                  (Mistral, Llama)
-```
-
-| Phase | What changes |
-|---|---|
-| 1 | Provider returns a mock string |
-| 2 | Provider makes real API calls |
-| 3 | Router runs a zero-shot classifier before picking a provider |
-| 4 | Router uses a trained ML model instead of if/else rules |
-| 5 | Logger gains a cache layer, providers use quantized models |
+**Technical scope:**
+- REST API with FastAPI
+- Rule-based and ML-based routing
+- NLP classification (zero-shot + TF-IDF/LR trained classifier)
+- SQLite logging with DB migration
+- In-memory response cache
+- Batch endpoint
+- Full observability via `metrics.py`
+- 28 unit + integration tests
 
 ---
 
-## Roadmap
+## Technical Strengths
 
-<details>
-<summary><strong>Phase 1 — Core Gateway [engineering] ✅ current</strong></summary>
+**Provider abstraction.** `OpenAIProvider` and `HuggingFaceProvider` both implement `generate_response(prompt) → str`. The router doesn't know or care which it's talking to. Swapping real APIs in requires one line.
 
-Build the skeleton: API, rule-based router, provider abstraction, SQLite logger.
-
-**What's engineering:** FastAPI schema design, clean module boundaries, provider interface, logging that never blocks the response path.
-
-**Tradeoff:** Rule-based routing is simple but fast. `priority == "high"` takes zero latency. A classifier takes 50-200ms. For Phase 1, if/else is correct — you need the structure before you need the intelligence.
-
-**Decision:** SQLite over a JSON file. Queryable from day one, no extra infra, good enough for thousands of requests locally.
-
-</details>
-
-<details>
-<summary><strong>Phase 2 — Real Providers [engineering + NLP]</strong></summary>
-
-Replace mocks with real API calls. OpenAI via `openai` SDK, HuggingFace via `InferenceClient`.
-
-**What's engineering:** Error handling, timeouts, fallback logic (if OpenAI fails, route to HF), provider health checks.
-
-**What's NLP:** Choosing which HuggingFace model to call. `mistralai/Mistral-7B-Instruct` for general tasks, `facebook/bart-large-cnn` for summarization.
-
-**Current state (2026):** HuggingFace `InferenceClient` is the standard for calling hosted open-source models. Mistral and Llama variants are the go-to cheap alternatives to GPT-4. This pattern is everywhere.
-
-**Tradeoff:** Self-hosted models vs. HuggingFace Inference API (hosted, costs money). For an MVP, use the hosted API — don't manage GPUs yet.
-
-</details>
-
-<details>
-<summary><strong>Phase 3 — Smarter Routing [NLP] ✅ done</strong></summary>
-
-Replaced `len(prompt) < 100` with a zero-shot classifier that detects actual task type — summarization, Q&A, code generation, general chat. Routes based on what the prompt is asking for, not how long it is.
-
-**What changed:**
-- Added `app/classifier.py` — loads `typeform/distilbert-base-uncased-mnli` once at startup
-- Updated `app/router.py` — calls `classify_prompt(prompt)` instead of checking length
-
-**Architecture:**
-```
-  incoming request
-        │
-        ▼
-  priority == "high"?  ──yes──► best model
-        │ no
-        ▼
-  max_cost < 0.01?     ──yes──► fast model
-        │ no
-        ▼
-  classify_prompt(prompt)          ← NEW in Phase 3
-        │
-  ┌─────┴──────────────┬──────────────────┐
-  ▼                    ▼                  ▼
-code generation    summarization    Q&A / general
-  │                    │                  │
-fast model         fast model        default model
-```
-
-**Why zero-shot over rule-based:**
-Length is a proxy. A 50-character prompt can be complex. A 200-character prompt can be trivial. Zero-shot reads the actual meaning — no training data needed.
-
-**Why this model (`typeform/distilbert-base-uncased-mnli`):**
-- ~260MB — runs on a 2015 MacBook
-- No GPU needed
-- `facebook/bart-large-mnli` is more accurate but ~1.6GB — too heavy for local dev
-
-**Why local pipeline, not an API call:**
-Routing decisions need to be fast and free. An API call for classification adds cost and network latency before the actual model call. Local pipeline runs in ~100-200ms and never hits a rate limit.
-
-**Known limitation:**
-Small model misclassifies some prompts — "What is the capital of France?" sometimes comes back as summarization instead of Q&A. Acceptable for now. Phase 4 fixes this with a fine-tuned classifier trained on your actual logs.
-
-**Relevant in 2026?** Yes for small systems. Frontier labs use learned routers with millions of examples. Zero-shot is the right starting point before you have data.
-
-</details>
-
-<details>
-<summary><strong>Phase 4 — Learned Router [NLP] ✅ done</strong></summary>
-
-Replaced the zero-shot classifier with a trained model. Input: prompt. Output: best model. No rules, no guessing — learned from data.
-
-**What changed:**
-- `scripts/generate_training_data.py` — generates synthetic (prompt, model) training pairs
-- `scripts/train_router.py` — trains and saves a TF-IDF + Logistic Regression classifier
-- `app/learned_router.py` — loads the trained model and predicts at request time
-- `app/router.py` — uses learned router if model exists, falls back to zero-shot otherwise
-
-**Architecture:**
-```
-  incoming request
-        │
-        ▼
-  priority == "high"?      ──yes──► best model
-        │ no
-        ▼
-  max_cost < 0.01?         ──yes──► fast model
-        │ no
-        ▼
-  trained model available?
-        │ yes                        │ no (fallback)
-        ▼                            ▼
-  predict_model(prompt)      classify_prompt(prompt)  ← Phase 3
-        │                            │
-        ▼                            ▼
-  learned prediction          zero-shot prediction
-```
-
-**Why TF-IDF + Logistic Regression, not DistilBERT fine-tuning:**
-
-Fine-tuning a transformer is the "proper" NLP approach — but it's not doable here for three reasons:
-
-1. **PyTorch version** — Intel Mac (2015) maxes out at torch 2.2.2. DistilBERT fine-tuning needs 2.4+.
-2. **Hardware** — fine-tuning on CPU takes hours or days. Not practical for development.
-3. **Data** — 103 synthetic examples is too few. Fine-tuning needs 1000+ real examples minimum.
-
-TF-IDF + Logistic Regression trains in seconds, requires no GPU, and works on any machine. It's a real learned classifier — just not a transformer. Many production routing systems use exactly this approach.
-
-**Upgrade path to DistilBERT fine-tuning (when ready):**
-- Accumulate real logged requests (1000+) from SQLite
-- Use Google Colab (free GPU) or a newer machine with Apple Silicon
-- Fine-tune DistilBERT on `(prompt, model)` pairs
-- Swap `predict_model` in `app/learned_router.py` to use the transformer — nothing else changes
-
-**Why synthetic data:**
-Real traffic requires running the system for weeks. Synthetic data lets you validate the training pipeline now. When real logs accumulate, swap `generate_training_data.py` for a script that reads from SQLite.
-
-**Performance on test set:**
-```
-              precision    recall    f1
-gpt-4            0.71       1.00    0.83
-mistral          1.00       0.64    0.78
-accuracy                            0.81
-```
-
-**On overfitting:**
-The first version had 60 clean, similar examples and got 100% accuracy — a sign it memorized the data rather than learning patterns. "Why do stars twinkle?" routed to Mistral instead of GPT-4.
-
-The fix: add more diverse examples — short questions, ambiguous phrasing, varied vocabulary — so the model learns the underlying pattern, not the surface words. After expanding to 103 examples with more variety, accuracy dropped to 81% on the test set but 6/6 correct on genuinely unseen prompts.
-
-81% is more honest. 100% on synthetic data is always suspicious.
-
-**Zero-shot fallback:**
-The router uses the learned model if `data/router_model.pkl` exists. If not, it falls back to the zero-shot classifier from Phase 3. This means the system always works — even before training.
+**Layered routing.** Rules run in priority order — hard constraints first (priority flag, cost cap), learned model second, zero-shot fallback third. The system always works even before any training.
 
 ```python
+if priority == "high":          # Rule 1: hard constraint
+    return gpt4
+if max_cost < 0.01:             # Rule 2: hard constraint
+    return mistral
 if is_trained_model_available():
-    model_name = predict_model(prompt)   # learned router
+    return predict_model(prompt)  # Rule 3: learned
 else:
-    task = classify_prompt(prompt)       # zero-shot fallback
+    return classify_prompt(prompt)  # Rule 4: zero-shot fallback
 ```
 
-**How to retrain:**
-```bash
-python scripts/generate_training_data.py
-python scripts/train_router.py
-```
+**No dead ends.** Learned router not trained yet? Falls back to zero-shot. Zero-shot uncertain? Returns default model. The system degrades gracefully at every layer.
 
-**Relevant in 2026?** This is how production routing works. TF-IDF classifiers power routing in systems that can't afford transformer inference on every request. Simple, fast, interpretable.
+**Cache keyed on (prompt, model).** Not just prompt. Same prompt routed to two different models gets two separate cache entries. Cache hits are logged with a `cache_hit:` prefix so metrics break them out.
 
-</details>
+**DB migration built in.** `init_db()` checks existing column names via `PRAGMA table_info` and `ALTER TABLE`s missing columns. Existing databases don't break when the schema changes.
 
-<details>
-<summary><strong>Phase 5 — Efficiency [engineering + NLP]</strong></summary>
-
-Optimize the hot path: response caching, request batching, and full observability through routing metrics.
-
-**What's built:**
-- **Exact-match cache** — in-memory dict keyed on `(prompt, model)`. Same prompt + same model = instant return, zero provider latency. Cache hits are logged with a `cache_hit:` prefix so metrics capture them separately.
-- **Batch endpoint** — `POST /chat/batch` accepts a list of prompts and a shared priority/cost policy. Each prompt routes independently, benefits from cache hits, and returns as an ordered list of responses.
-- **Routing distribution** — `metrics.py` now breaks down every routing reason (`priority==high`, `max_cost<0.01`, `zero_shot:code generation`, `learned_router`, `cache_hit:...`). Run `python metrics.py` after some traffic to see where requests land.
-
-**Design trade-off — exact-match vs semantic cache:**
-Exact-match is O(1) and has zero false positives. Semantic caching (embed the prompt, find nearest neighbor) catches paraphrases but adds ~50ms of embedding overhead per miss and can return wrong answers for prompts that look similar but aren't. Exact-match is the right default for a gateway that doesn't own the semantic meaning of prompts.
-
-**What's NLP:** Quantization (4-bit, 8-bit) is the obvious next step for self-hosted models — cuts memory and speeds inference with minimal quality loss. Not implemented here (no local GPU), but the architecture slot exists.
-
-**Current state (2026):** Caching and batching are table stakes in any production inference stack. Every major provider (OpenAI, Together, Fireworks) exposes a batch API. Exact-match caching alone can cut costs 30–60% for workloads with repeated prompts (evals, CI pipelines, chat templates).
-
-</details>
-
----
-
-## How It Works
-
-### Routing Decision Flow
-
-**Phase 1** (if/else rules):
-```
-  incoming request
-        │
-        ▼
-  priority == "high"?  ──yes──► GPT-4
-        │ no
-        ▼
-  max_cost < 0.01?     ──yes──► Mistral
-        │ no
-        ▼
-  len(prompt) < 100?   ──yes──► Mistral
-        │ no
-        ▼
-      default          ────────► GPT-4
-```
-
-**Phase 3** (zero-shot classifier replaces length check):
-```
-  incoming request
-        │
-        ▼
-  priority == "high"?  ──yes──► best model
-        │ no
-        ▼
-  max_cost < 0.01?     ──yes──► fast model
-        │ no
-        ▼
-  classify_prompt(prompt)
-  ┌─────┴──────────────┬──────────────────┐
-  ▼                    ▼                  ▼
-code generation    summarization    Q&A / general
-  │                    │                  │
-fast model         fast model        default model
-```
-
-<details>
-<summary><strong>The Endpoint</strong></summary>
-
-`POST /chat` accepts a JSON body with three fields:
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `prompt` | string | yes | The text you want to send to a model |
-| `priority` | `low` / `medium` / `high` | no | How urgently you need a good response |
-| `max_cost` | float | no | The max cost per request you're willing to pay |
-
-**Example request:**
-```json
-{
-  "prompt": "Explain what a transformer model is",
-  "priority": "high",
-  "max_cost": 0.05
-}
-```
-
-**Example response:**
-```json
-{
-  "response": "A transformer model is...",
-  "model_used": "gpt-4"
-}
-```
-
-</details>
-
-<details>
-<summary><strong>The Routing Rules</strong></summary>
-
-When a request comes in, the router checks fields in this order and stops at the first match:
-
-**Rule 1 — Priority is high → GPT-4**
-```
-priority == "high"  →  OpenAI GPT-4
-```
-You've said this request matters. Send it to the best model regardless of cost.
-
-**Rule 2 — Max cost is low → Cheapest model**
-```
-max_cost < 0.01  →  Mistral 7B (HuggingFace)
-```
-You've set a tight budget. Send it to the cheapest available model.
-
-**Rule 3 — Short prompt → Mistral**
-```
-len(prompt) < 100 characters  →  Mistral 7B (HuggingFace)
-```
-Short prompts are usually simple questions. A smaller, faster model handles them fine.
-
-**Default → GPT-4**
-```
-nothing matched  →  OpenAI GPT-4
-```
-When in doubt, use the best model.
-
-</details>
-
-<details>
-<summary><strong>The Providers</strong></summary>
-
-Both providers are **mocked in Phase 1** — they return a fake string instead of calling a real API. The real API calls are stubbed out in comments, ready to be wired up in Phase 2.
-
-- `OpenAIProvider` — wraps GPT-4 and GPT-3.5. Uses the `openai` SDK.
-- `HuggingFaceProvider` — wraps Mistral and other open-source models. Uses `InferenceClient`.
-
-Both share the same interface: `generate_response(prompt) → str`. The router doesn't care which provider it picks — it just calls `generate_response`.
-
-</details>
-
-<details>
-<summary><strong>The Logger</strong></summary>
-
-Every request is automatically logged to `logs/requests.db` (SQLite).
-
-| Field | Description |
-|---|---|
-| `timestamp` | When the request was made |
-| `prompt` | The full prompt text |
-| `selected_model` | Which model the router picked |
-| `latency_ms` | How long the provider took to respond |
-| `response_length` | Number of characters in the response |
-
-This data becomes the training set for the Phase 4 learned router.
-
-</details>
+**Synthetic data with diversity controls.** First version of training data got 100% accuracy — a red flag. Added diverse phrasing, short questions, ambiguous prompts. Accuracy dropped to 81% and real-world predictions improved. 81% is more honest than 100%.
 
 ---
 
 ## Architecture
 
+```
+  Client
+    │
+    │  POST /chat { prompt, priority, max_cost }
+    │  POST /chat/batch { prompts[], priority, max_cost }
+    ▼
+┌────────────────────────────────────────────────┐
+│                  LLM Gateway                    │
+│                                                 │
+│  FastAPI  →  Cache  →  Router  →  Provider      │
+│                           │                     │
+│                    ┌──────┴──────┐              │
+│                    ▼             ▼              │
+│               Rule-based    ML classifier       │
+│               (priority,    (TF-IDF+LR or       │
+│                cost)         zero-shot)         │
+│                                                 │
+│                        Logger (SQLite)          │
+└────────────────────────────────────────────────┘
+         │                        │
+         ▼                        ▼
+    OpenAI API            HuggingFace API
+    (GPT-4)               (Mistral 7B)
+```
+
+**Request path:**
+1. Cache check — if `(prompt, model)` seen before, return immediately
+2. Router — picks provider and model, records the reason
+3. Provider — calls the model
+4. Logger — writes prompt, model, reason, latency, response length to SQLite
+
+---
+
+## Routing Decision Flow
+
+```
+  incoming request
+        │
+        ▼
+  priority == "high"?      ──yes──► GPT-4        [rule-based]
+        │ no
+        ▼
+  max_cost < 0.01?         ──yes──► Mistral       [rule-based]
+        │ no
+        ▼
+  trained model available?
+        │ yes                          │ no
+        ▼                              ▼
+  predict_model(prompt)        classify_prompt(prompt)   [zero-shot]
+        │                              │
+        └──────────────┬───────────────┘
+                       ▼
+              route to model
+```
+
+---
+
+## Phases
+
+| Phase | What it adds | Type |
+|---|---|---|
+| 1 | FastAPI skeleton, if/else router, SQLite logger | Engineering |
+| 2 | Real provider API calls (OpenAI SDK, HF InferenceClient) | Engineering + NLP |
+| 3 | Zero-shot classifier replaces length heuristic | NLP |
+| 4 | TF-IDF + LR trained on synthetic data, zero-shot fallback | NLP |
+| 5 | Exact-match cache, batch endpoint, routing metrics | Engineering |
+
 <details>
-<summary><strong>Evolution by phase</strong></summary>
+<summary>Phase 1 — Core Gateway</summary>
 
-```
-Phase 1 ──► Phase 2 ──► Phase 3 ──► Phase 4 ──► Phase 5
-  │             │            │           │           │
-Rules        Real         NLP         Learned     Efficient
-(if/else,    APIs         signals     router      inference
- fast)       wired        (zero-      (fine-      (cache,
-             up           shot)       tuned)      quant)
+**Decision:** SQLite over a flat file. Queryable from day one, zero extra infra.
 
-[engineering] [eng+NLP]  [NLP]       [NLP]       [eng+NLP]
-```
+**Decision:** If/else routing before any ML. You need the plumbing correct before you add intelligence. A classifier adds 100-200ms. `priority == "high"` adds zero.
+
+</details>
+
+<details>
+<summary>Phase 2 — Real Providers</summary>
+
+Both providers share one interface: `generate_response(prompt) → str`. The router never calls a provider directly — it calls the interface. Adding a new provider (Anthropic, Cohere) means adding one file, not touching the router.
+
+Mocked in this repo — no API keys needed. To wire real calls: add `OPENROUTER_API_KEY` to `.env`, swap providers in `router.py`.
+
+</details>
+
+<details>
+<summary>Phase 3 — Zero-Shot Classification</summary>
+
+**What:** Model `typeform/distilbert-base-uncased-mnli` classifies prompt intent — code generation, summarization, Q&A, general chat — without being trained on any examples.
+
+**Why not rule-based:** Length is a bad proxy. A 50-character prompt can be complex. A 200-character prompt can be trivial. Zero-shot reads meaning, not character count.
+
+**Why this model:** ~260MB, no GPU needed, runs in ~100-200ms on any machine. `facebook/bart-large-mnli` is more accurate but 1.6GB — too heavy for local dev.
+
+**Known limit:** Small model misclassifies ambiguous prompts. "What is the capital of France?" sometimes comes back as summarization. Phase 4 fixes this with training.
+
+</details>
+
+<details>
+<summary>Phase 4 — Learned Router</summary>
+
+**What:** TF-IDF vectorizer + Logistic Regression classifier trained on 103 synthetic `(prompt, model)` pairs. Predicts which model to use without any rules.
+
+**Why not DistilBERT fine-tuning:** Three real constraints:
+- Intel Mac (2015) maxes at torch 2.2.2. Fine-tuning needs 2.4+.
+- CPU fine-tuning takes hours. Not practical.
+- 103 examples is too few. Fine-tuning needs 1000+ minimum.
+
+TF-IDF + LR trains in under a second, requires no GPU, gets 81% accuracy on held-out synthetic data. Many production routing systems use exactly this approach.
+
+**On the 81% number:** The first version got 100% — trained on 60 similar examples and memorized them. After adding diverse, ambiguous, and short-form examples, accuracy dropped to 81% but out-of-sample predictions improved. 100% on a small clean dataset is a warning sign.
+
+**Upgrade path:** Accumulate 1000+ real requests from SQLite, fine-tune DistilBERT on Colab, swap `predict_model()` in `learned_router.py`. Nothing else changes.
+
+</details>
+
+<details>
+<summary>Phase 5 — Efficiency + Observability</summary>
+
+**Cache:** Exact-match dict keyed on `(prompt, model)`. O(1) lookup, zero false positives. Semantic caching (embed + nearest neighbor) catches paraphrases but adds ~50ms overhead per miss and can return wrong answers for near-similar prompts. Exact-match is the right default for a gateway that doesn't own the semantic meaning of prompts.
+
+**Batch endpoint:** `POST /chat/batch` accepts a list of prompts with shared priority/cost settings. Each prompt routes independently and benefits from the cache.
+
+**Metrics:** `python metrics.py` shows usage per model, avg latency, and routing distribution. Cache hits show up as `cache_hit:learned_router` etc. — separate from cold requests.
 
 </details>
 
@@ -386,143 +183,113 @@ Rules        Real         NLP         Learned     Efficient
 ## NLP Concepts
 
 <details>
-<summary><strong>Zero-Shot Classification</strong></summary>
+<summary>Zero-Shot Classification</summary>
 
-You give a model some text and a list of category labels. It tells you which label fits best — without ever being trained on your specific categories.
-
-Normal classification requires training data: thousands of labeled examples before the model can do anything. Zero-shot skips that. The model already understands language well enough to figure it out from the label names alone.
+Normal classification needs labeled training data. Zero-shot skips it — the model figures out which category fits from the label names alone.
 
 ```python
-from transformers import pipeline
+classifier = pipeline("zero-shot-classification", model="typeform/distilbert-base-uncased-mnli")
 
-classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
-
-# Easy case — strong signal in the text
 result = classifier(
-    "the login button doesn't work on mobile",
-    candidate_labels=["summarization", "question answering", "code generation", "general chat"]
+    "write a function to sort a list",
+    candidate_labels=["code generation", "summarization", "Q&A", "general chat"]
 )
-# Output: code generation    → 78%
-#         general chat       → 14%
-# → router picks: CodeLlama
+# → code generation: 84%
 
-# Hard case — ambiguous
 result = classifier(
-    "make this shorter",
-    candidate_labels=["summarization", "question answering", "code generation", "general chat"]
+    "make this shorter",   # ambiguous
+    candidate_labels=["code generation", "summarization", "Q&A", "general chat"]
 )
-# Output: summarization      → 41%
-#         general chat       → 35%   ← model is unsure
-# → zero-shot struggles here, fine-tuning on your logs would do better
+# → summarization: 41%, general chat: 35%  ← model is unsure
 ```
 
-**Used here:** Phase 3 routing. **Relevant in 2026?** Yes for cheap local routing. For anything heavier, just ask an LLM directly.
+**Relevant in 2026?** Yes for cheap local classification before you have training data. Once you have logs, replace it with a fine-tuned model.
 
 </details>
 
 <details>
-<summary><strong>Fine-Tuning</strong></summary>
+<summary>TF-IDF + Logistic Regression</summary>
 
-Taking a model that already understands language and training it further on your specific data.
+TF-IDF turns text into numbers: words that appear often in one class but rarely overall get high weight. Logistic Regression draws a boundary between classes in that number space.
 
-You don't start from scratch. A base model like DistilBERT has already learned grammar, context, and meaning from billions of words. Fine-tuning adds the last mile — teaching it your specific task with a small labeled dataset.
+Not a transformer. Trains in milliseconds, runs in microseconds, uses no GPU. Interpretable — you can inspect which words push toward which class.
 
 ```python
-from transformers import Trainer, TrainingArguments
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 
-# logged data: (prompt, model_that_produced_best_result)
-# e.g. ("summarize this report", "bart-large-cnn")
-#      ("write a python script", "codellama")
-
-trainer = Trainer(
-    model=distilbert,
-    args=TrainingArguments(output_dir="./router", num_train_epochs=3),
-    train_dataset=logged_requests,
-)
-trainer.train()
-
-# After training:
-# Input:  "Can you write a sorting algorithm in Python?"
-# Output: codellama  ← learned from logs, not hardcoded
+model = Pipeline([
+    ("tfidf", TfidfVectorizer(ngram_range=(1, 2))),
+    ("clf", LogisticRegression(max_iter=1000)),
+])
+model.fit(prompts, labels)
+model.predict(["write a sorting algorithm in Python"])
+# → "mistral"
 ```
 
-**Tradeoff:** Needs 500-1000 examples minimum. That's why Phase 1 logging matters. **Relevant in 2026?** Yes for narrow tasks — a fine-tuned classifier costs a fraction of a GPT-4 call at scale.
+**Relevant in 2026?** Yes. Fast, cheap, explainable. Used in production routing at scale — not everything needs a transformer.
 
 </details>
 
 <details>
-<summary><strong>Text Generation</strong></summary>
+<summary>Fine-Tuning</summary>
 
-The model reads your prompt and predicts the next word. Then the next. Then the next — until done.
+Taking a pretrained model (DistilBERT, Llama) and continuing training on your specific task. The model already understands language — fine-tuning adds the last mile.
 
-What makes transformers powerful is attention: when predicting each word, the model can look at every other word in the input at once. Older models forgot early context. Transformers don't.
+Not implemented here due to hardware constraints. But the architecture is ready: once `logs/requests.db` has enough real `(prompt, model)` pairs, fine-tune DistilBERT on Colab and swap `predict_model()`. One function, nothing else changes.
 
-```
-Prompt:   "The capital of France is"
-Step 1:   model predicts → "Paris"
-Step 2:   model predicts → "."
-Step 3:   model predicts → [end]
-```
-
-```python
-from huggingface_hub import InferenceClient
-
-client = InferenceClient(model="mistralai/Mistral-7B-Instruct-v0.3")
-response = client.text_generation("Explain transformers in one sentence.", max_new_tokens=100)
-# → "A transformer model is a neural network that uses attention to process sequences in parallel."
-```
-
-**Tradeoff:** Longer output = more cost. This is why `max_cost` matters as a routing signal. **Relevant in 2026?** Foundation of everything. Non-negotiable to understand.
+**Relevant in 2026?** Yes for narrow classification tasks. A fine-tuned 66M-param DistilBERT costs a fraction of a GPT-4 call per request at scale.
 
 </details>
 
 <details>
-<summary><strong>Quantization</strong></summary>
+<summary>Quantization</summary>
 
-Shrinking a model by reducing the precision of its numbers.
-
-Models store weights as 32-bit floats by default. Quantization rounds them to 8-bit or 4-bit integers. The quality loss is small. The size reduction is large.
+Running a model at lower numerical precision — 8-bit or 4-bit integers instead of 32-bit floats. Cuts memory 4-8x with minimal quality loss.
 
 ```
-fp32 (default):   28GB RAM  — needs a high-end GPU
-fp16:             14GB RAM  — still needs a GPU
-8-bit:             7GB RAM  — runs on most GPUs
-4-bit:             4GB RAM  — runs on a MacBook
+fp32:   28GB  — needs a high-end GPU
+fp16:   14GB  — needs a GPU
+8-bit:   7GB  — most GPUs work
+4-bit:   4GB  — runs on a MacBook
 ```
 
-```python
-model = AutoModelForCausalLM.from_pretrained(
-    "mistralai/Mistral-7B-v0.1",
-    quantization_config=BitsAndBytesConfig(load_in_4bit=True)
-)
-# same model, 7x smaller, slightly lower quality
-```
+Not implemented here (no local GPU). Relevant if you run self-hosted models.
 
-**Used here:** Phase 5 for self-hosted models. **Relevant in 2026?** Standard practice. `bitsandbytes` and GGUF are the common tools.
+**Relevant in 2026?** Standard. `bitsandbytes` and GGUF are the common tools. Anyone running open-source models locally uses this.
 
 </details>
 
-<details>
-<summary><strong>Embeddings (Phase 5)</strong></summary>
+---
 
-Turn text into a list of numbers where similar meaning = similar numbers.
+## What's Relevant in 2026, What's Not
 
-"What is a dog?" and "Explain what dogs are" produce vectors close to each other. "What is a dog?" and "Deploy to Kubernetes" are far apart. Distance between vectors = distance between meanings.
+**Still relevant:**
+- Provider abstraction pattern — every inference platform uses this
+- Layered routing (rules → learned → fallback) — production pattern
+- TF-IDF classifiers for cheap high-volume routing decisions
+- Zero-shot classification for bootstrapping before you have labels
+- Exact-match caching — cuts cost 30-60% for workloads with repeated prompts
+- SQLite for local observability — simple, works, queryable
 
-```python
-from sentence_transformers import SentenceTransformer
+**Less relevant / simplified for this project:**
+- Fine-tuning on CPU — not practical anymore. Use cloud GPUs (Colab, Modal, RunPod)
+- Synthetic training data — real logs are always better. Synthetic is a bootstrap only
+- Exact-match cache at scale — semantic caching (embeddings + vector DB) handles paraphrases. Relevant for production, overkill here
+- Quantization — matters when you self-host. Less relevant if you're calling APIs
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
-embeddings = model.encode(["What is a transformer?", "Explain transformers", "Deploy to Kubernetes"])
+---
 
-# cosine similarity:
-# prompt 1 vs prompt 2 → 0.96  (same meaning → cache hit)
-# prompt 1 vs prompt 3 → 0.11  (different meaning → no cache hit)
-```
+## Takeaways
 
-**Used here:** Phase 5 semantic caching. **Relevant in 2026?** One of the most useful concepts in production ML. Powers RAG, semantic search, and similarity caching.
+The routing logic is the core engineering problem. It's not "call GPT-4 for everything" — it's deciding which model is good enough for each request, at what cost, with what latency budget. That decision happens on every request at production scale.
 
-</details>
+The 5-phase structure mirrors how real systems evolve. Phase 1 rules still run in production — they handle hard constraints faster than any model can. The learned router runs for everything else.
+
+Logging every routing decision isn't optional. It's how you know if the router is working, and it's your training data for the next version.
+
+81% accuracy on the learned router sounds unimpressive. On 200 requests a day where the alternative is sending everything to GPT-4, it's the difference between a $10 bill and a $2 bill. Routing matters.
 
 ---
 
@@ -530,15 +297,28 @@ embeddings = model.encode(["What is a transformer?", "Explain transformers", "De
 
 ```
 app/
-  main.py               # FastAPI entry point
-  router.py             # Routing logic
-  schemas.py            # Request/response models
-  logger.py             # SQLite request logger
+  main.py               # FastAPI entry, cache check, /chat and /chat/batch
+  router.py             # Routing logic — rules, learned, zero-shot fallback
+  schemas.py            # Request/response Pydantic models
+  logger.py             # SQLite logger with DB migration
+  cache.py              # Exact-match in-memory cache
+  classifier.py         # Zero-shot classification pipeline
+  learned_router.py     # TF-IDF + LR model loader and predictor
   providers/
+    base.py
     openai_provider.py
     huggingface_provider.py
-metrics.py              # Avg latency and usage per model
-requirements.txt
+    openrouter_provider.py  # built, not wired — ready for real API calls
+scripts/
+  generate_training_data.py
+  train_router.py
+  smoke_test.py         # End-to-end test against running server
+tests/
+  test_router.py
+  test_api.py
+  test_classifier.py
+  test_cache_and_batch.py
+metrics.py              # CLI: usage per model, latency, routing distribution
 ```
 
 ---
@@ -546,32 +326,31 @@ requirements.txt
 ## Setup
 
 ```bash
-python -m venv venv
-source venv/bin/activate
+python3.11 -m venv venv311
+source venv311/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-Visit http://localhost:8000/docs for the interactive API UI.
+Visit `http://localhost:8000/docs` for the interactive API.
 
----
-
-## Running Tests
-
+**Train the learned router:**
 ```bash
-source venv311/bin/activate
+python scripts/generate_training_data.py
+python scripts/train_router.py
+```
+
+**Run tests:**
+```bash
 python -m pytest tests/ -v
 ```
 
-19 tests covering:
-- Unit tests for routing rules (`tests/test_router.py`)
-- Integration tests for the `/chat` endpoint (`tests/test_api.py`)
-- Unit tests for the classifier and learned router (`tests/test_classifier.py`)
-
----
-
-## Example Request
-
+**Smoke test against running server:**
 ```bash
-curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '{"prompt": "Explain transformers in one sentence", "priority": "high"}'
+python scripts/smoke_test.py
+```
+
+**Check metrics:**
+```bash
+python metrics.py
 ```
