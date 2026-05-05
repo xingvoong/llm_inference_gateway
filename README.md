@@ -126,15 +126,77 @@ Small model misclassifies some prompts — "What is the capital of France?" some
 </details>
 
 <details>
-<summary><strong>Phase 4 — Learned Router [NLP]</strong></summary>
+<summary><strong>Phase 4 — Learned Router [NLP] ✅ done</strong></summary>
 
-Train a classifier on your logged requests. Input: prompt. Output: best model. Replace the rules entirely.
+Replaced the zero-shot classifier with a trained model. Input: prompt. Output: best model. No rules, no guessing — learned from data.
 
-**What's NLP:** Fine-tuning a small transformer (DistilBERT or similar) on `(prompt, chosen_model, latency, cost)` tuples from your SQLite logs. The logs you're building in Phase 1 are the training data.
+**What changed:**
+- `scripts/generate_training_data.py` — generates synthetic (prompt, model) training pairs
+- `scripts/train_router.py` — trains and saves a TF-IDF + Logistic Regression classifier
+- `app/learned_router.py` — loads the trained model and predicts at request time
+- `app/router.py` — uses learned router if model exists, falls back to zero-shot otherwise
 
-**Current state (2026):** This is how serious routing systems work. Companies like Martian and Unify have built businesses on learned routers. DistilBERT fine-tuning runs on a laptop.
+**Architecture:**
+```
+  incoming request
+        │
+        ▼
+  priority == "high"?      ──yes──► best model
+        │ no
+        ▼
+  max_cost < 0.01?         ──yes──► fast model
+        │ no
+        ▼
+  trained model available?
+        │ yes                        │ no (fallback)
+        ▼                            ▼
+  predict_model(prompt)      classify_prompt(prompt)  ← Phase 3
+        │                            │
+        ▼                            ▼
+  learned prediction          zero-shot prediction
+```
 
-**Tradeoff:** You need enough logged data before this is worth training. 500-1000 labeled examples minimum. That's why Phase 1 logging matters — you're collecting the dataset now.
+**Why TF-IDF + Logistic Regression over DistilBERT:**
+- Trains in seconds on any hardware including a 2015 MacBook
+- No GPU, no torch version conflicts
+- 100% accuracy on test set with 60 training examples
+- DistilBERT is the upgrade path when you have thousands of real logged requests and better hardware
+
+**Why synthetic data:**
+Real traffic requires running the system for weeks. Synthetic data lets you validate the training pipeline now. When real logs accumulate, swap `generate_training_data.py` for a script that reads from SQLite.
+
+**Performance on test set:**
+```
+              precision    recall    f1
+gpt-4            0.71       1.00    0.83
+mistral          1.00       0.64    0.78
+accuracy                            0.81
+```
+
+**On overfitting:**
+The first version had 60 clean, similar examples and got 100% accuracy — a sign it memorized the data rather than learning patterns. "Why do stars twinkle?" routed to Mistral instead of GPT-4.
+
+The fix: add more diverse examples — short questions, ambiguous phrasing, varied vocabulary — so the model learns the underlying pattern, not the surface words. After expanding to 103 examples with more variety, accuracy dropped to 81% on the test set but 6/6 correct on genuinely unseen prompts.
+
+81% is more honest. 100% on synthetic data is always suspicious.
+
+**Zero-shot fallback:**
+The router uses the learned model if `data/router_model.pkl` exists. If not, it falls back to the zero-shot classifier from Phase 3. This means the system always works — even before training.
+
+```python
+if is_trained_model_available():
+    model_name = predict_model(prompt)   # learned router
+else:
+    task = classify_prompt(prompt)       # zero-shot fallback
+```
+
+**How to retrain:**
+```bash
+python scripts/generate_training_data.py
+python scripts/train_router.py
+```
+
+**Relevant in 2026?** This is how production routing works. TF-IDF classifiers power routing in systems that can't afford transformer inference on every request. Simple, fast, interpretable.
 
 </details>
 
@@ -475,6 +537,20 @@ uvicorn app.main:app --reload
 ```
 
 Visit http://localhost:8000/docs for the interactive API UI.
+
+---
+
+## Running Tests
+
+```bash
+source venv311/bin/activate
+python -m pytest tests/ -v
+```
+
+19 tests covering:
+- Unit tests for routing rules (`tests/test_router.py`)
+- Integration tests for the `/chat` endpoint (`tests/test_api.py`)
+- Unit tests for the classifier and learned router (`tests/test_classifier.py`)
 
 ---
 
