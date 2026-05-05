@@ -156,11 +156,21 @@ Replaced the zero-shot classifier with a trained model. Input: prompt. Output: b
   learned prediction          zero-shot prediction
 ```
 
-**Why TF-IDF + Logistic Regression over DistilBERT:**
-- Trains in seconds on any hardware including a 2015 MacBook
-- No GPU, no torch version conflicts
-- 100% accuracy on test set with 60 training examples
-- DistilBERT is the upgrade path when you have thousands of real logged requests and better hardware
+**Why TF-IDF + Logistic Regression, not DistilBERT fine-tuning:**
+
+Fine-tuning a transformer is the "proper" NLP approach — but it's not doable here for three reasons:
+
+1. **PyTorch version** — Intel Mac (2015) maxes out at torch 2.2.2. DistilBERT fine-tuning needs 2.4+.
+2. **Hardware** — fine-tuning on CPU takes hours or days. Not practical for development.
+3. **Data** — 103 synthetic examples is too few. Fine-tuning needs 1000+ real examples minimum.
+
+TF-IDF + Logistic Regression trains in seconds, requires no GPU, and works on any machine. It's a real learned classifier — just not a transformer. Many production routing systems use exactly this approach.
+
+**Upgrade path to DistilBERT fine-tuning (when ready):**
+- Accumulate real logged requests (1000+) from SQLite
+- Use Google Colab (free GPU) or a newer machine with Apple Silicon
+- Fine-tune DistilBERT on `(prompt, model)` pairs
+- Swap `predict_model` in `app/learned_router.py` to use the transformer — nothing else changes
 
 **Why synthetic data:**
 Real traffic requires running the system for weeks. Synthetic data lets you validate the training pipeline now. When real logs accumulate, swap `generate_training_data.py` for a script that reads from SQLite.
