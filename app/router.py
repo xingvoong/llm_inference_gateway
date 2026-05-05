@@ -17,21 +17,21 @@ def _get_provider(model_name: str) -> BaseProvider:
     return HuggingFaceProvider(model=model_name)
 
 
-def route_request(prompt: str, priority: str = None, max_cost: float = None) -> tuple[BaseProvider, str]:
+def route_request(prompt: str, priority: str = None, max_cost: float = None) -> tuple[BaseProvider, str, str]:
     # Rule 1: high priority always gets the best model
     if priority == "high":
-        return OpenAIProvider(model=BEST_MODEL), BEST_MODEL
+        return OpenAIProvider(model=BEST_MODEL), BEST_MODEL, "priority==high"
 
     # Rule 2: strict budget gets the cheapest model
     if max_cost is not None and max_cost < LOW_COST_THRESHOLD:
-        return HuggingFaceProvider(model=FAST_MODEL), FAST_MODEL
+        return HuggingFaceProvider(model=FAST_MODEL), FAST_MODEL, "max_cost<0.01"
 
     # Rule 3: use learned router if trained model exists, else fall back to zero-shot
     if is_trained_model_available():
         model_name = predict_model(prompt)
-        return _get_provider(model_name), model_name
+        return _get_provider(model_name), model_name, "learned_router"
     else:
         task = classify_prompt(prompt)
         if task in ("code generation", "summarization"):
-            return HuggingFaceProvider(model=FAST_MODEL), FAST_MODEL
-        return OpenAIProvider(model=DEFAULT_MODEL), DEFAULT_MODEL
+            return HuggingFaceProvider(model=FAST_MODEL), FAST_MODEL, f"zero_shot:{task}"
+        return OpenAIProvider(model=DEFAULT_MODEL), DEFAULT_MODEL, f"zero_shot:{task}"

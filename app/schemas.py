@@ -18,3 +18,13 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     model_used: str
+
+
+class BatchChatRequest(BaseModel):
+    prompts: list[str]
+    priority: Optional[Priority] = None
+    max_cost: Optional[float] = None
+
+
+class BatchChatResponse(BaseModel):
+    results: list[ChatResponse]

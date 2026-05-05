@@ -213,13 +213,19 @@ python scripts/train_router.py
 <details>
 <summary><strong>Phase 5 — Efficiency [engineering + NLP]</strong></summary>
 
-Optimize the hot path: response caching, request batching, model quantization for self-hosted models.
+Optimize the hot path: response caching, request batching, and full observability through routing metrics.
 
-**What's engineering:** Cache layer (exact-match or semantic), batch queue for high-volume periods, latency SLOs per model.
+**What's built:**
+- **Exact-match cache** — in-memory dict keyed on `(prompt, model)`. Same prompt + same model = instant return, zero provider latency. Cache hits are logged with a `cache_hit:` prefix so metrics capture them separately.
+- **Batch endpoint** — `POST /chat/batch` accepts a list of prompts and a shared priority/cost policy. Each prompt routes independently, benefits from cache hits, and returns as an ordered list of responses.
+- **Routing distribution** — `metrics.py` now breaks down every routing reason (`priority==high`, `max_cost<0.01`, `zero_shot:code generation`, `learned_router`, `cache_hit:...`). Run `python metrics.py` after some traffic to see where requests land.
 
-**What's NLP:** Quantization (4-bit, 8-bit) for any self-hosted models. Cuts memory and speeds up inference with minimal quality loss.
+**Design trade-off — exact-match vs semantic cache:**
+Exact-match is O(1) and has zero false positives. Semantic caching (embed the prompt, find nearest neighbor) catches paraphrases but adds ~50ms of embedding overhead per miss and can return wrong answers for prompts that look similar but aren't. Exact-match is the right default for a gateway that doesn't own the semantic meaning of prompts.
 
-**Current state (2026):** Quantization is mature and widely used. `bitsandbytes` and GGUF formats make it straightforward. Standard practice for anyone running open-source models locally.
+**What's NLP:** Quantization (4-bit, 8-bit) is the obvious next step for self-hosted models — cuts memory and speeds inference with minimal quality loss. Not implemented here (no local GPU), but the architecture slot exists.
+
+**Current state (2026):** Caching and batching are table stakes in any production inference stack. Every major provider (OpenAI, Together, Fireworks) exposes a batch API. Exact-match caching alone can cut costs 30–60% for workloads with repeated prompts (evals, CI pipelines, chat templates).
 
 </details>
 
