@@ -4,6 +4,8 @@ A FastAPI service that routes prompts to different LLM providers using rule-base
 
 Not every prompt needs GPT-4. This gateway picks the right model based on priority, prompt length, and cost — then logs every decision as training data for a future learned router.
 
+**Current state:** Providers are mocked — no API keys or credits needed. The `OpenRouterProvider` is built and ready (`app/providers/openrouter_provider.py`) but not wired in. To use real models, add an `OPENROUTER_API_KEY` to `.env` and swap the providers in `router.py`.
+
 ---
 
 ## System Architecture
