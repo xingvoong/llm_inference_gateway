@@ -79,17 +79,49 @@ Replace mocks with real API calls. OpenAI via `openai` SDK, HuggingFace via `Inf
 </details>
 
 <details>
-<summary><strong>Phase 3 — Smarter Routing [NLP]</strong></summary>
+<summary><strong>Phase 3 — Smarter Routing [NLP] ✅ done</strong></summary>
 
-Replace `len(prompt) < 100` with a zero-shot classifier that detects task type — summarization, Q&A, generation, code. Route based on what the prompt is actually asking for.
+Replaced `len(prompt) < 100` with a zero-shot classifier that detects actual task type — summarization, Q&A, code generation, general chat. Routes based on what the prompt is asking for, not how long it is.
 
-**What's NLP:** Zero-shot classification pipeline (`facebook/bart-large-mnli`). No fine-tuning, no training data. Give it a prompt and a list of labels, it returns probabilities.
+**What changed:**
+- Added `app/classifier.py` — loads `typeform/distilbert-base-uncased-mnli` once at startup
+- Updated `app/router.py` — calls `classify_prompt(prompt)` instead of checking length
 
-**Current state (2026):** Zero-shot classification is still practical for low-stakes routing decisions. It's not how frontier labs route — they use learned routers trained on millions of examples — but it's a legitimate pattern for smaller systems and a clean stepping stone to Phase 4.
+**Architecture:**
+```
+  incoming request
+        │
+        ▼
+  priority == "high"?  ──yes──► best model
+        │ no
+        ▼
+  max_cost < 0.01?     ──yes──► fast model
+        │ no
+        ▼
+  classify_prompt(prompt)          ← NEW in Phase 3
+        │
+  ┌─────┴──────────────┬──────────────────┐
+  ▼                    ▼                  ▼
+code generation    summarization    Q&A / general
+  │                    │                  │
+fast model         fast model        default model
+```
 
-**Tradeoff:** Adds 100-200ms latency per request. Worth it if it meaningfully improves model selection. Measure first.
+**Why zero-shot over rule-based:**
+Length is a proxy. A 50-character prompt can be complex. A 200-character prompt can be trivial. Zero-shot reads the actual meaning — no training data needed.
 
-**Decision:** Run the classifier as a local pipeline, not an API call. Keeps routing latency predictable and free.
+**Why this model (`typeform/distilbert-base-uncased-mnli`):**
+- ~260MB — runs on a 2015 MacBook
+- No GPU needed
+- `facebook/bart-large-mnli` is more accurate but ~1.6GB — too heavy for local dev
+
+**Why local pipeline, not an API call:**
+Routing decisions need to be fast and free. An API call for classification adds cost and network latency before the actual model call. Local pipeline runs in ~100-200ms and never hits a rate limit.
+
+**Known limitation:**
+Small model misclassifies some prompts — "What is the capital of France?" sometimes comes back as summarization instead of Q&A. Acceptable for now. Phase 4 fixes this with a fine-tuned classifier trained on your actual logs.
+
+**Relevant in 2026?** Yes for small systems. Frontier labs use learned routers with millions of examples. Zero-shot is the right starting point before you have data.
 
 </details>
 
@@ -121,10 +153,11 @@ Optimize the hot path: response caching, request batching, model quantization fo
 
 ---
 
-## Phase 1 — How It Works
+## How It Works
 
 ### Routing Decision Flow
 
+**Phase 1** (if/else rules):
 ```
   incoming request
         │
@@ -132,13 +165,32 @@ Optimize the hot path: response caching, request batching, model quantization fo
   priority == "high"?  ──yes──► GPT-4
         │ no
         ▼
-  max_cost < 0.01?     ──yes──► Cheapest model (Mistral)
+  max_cost < 0.01?     ──yes──► Mistral
         │ no
         ▼
   len(prompt) < 100?   ──yes──► Mistral
         │ no
         ▼
       default          ────────► GPT-4
+```
+
+**Phase 3** (zero-shot classifier replaces length check):
+```
+  incoming request
+        │
+        ▼
+  priority == "high"?  ──yes──► best model
+        │ no
+        ▼
+  max_cost < 0.01?     ──yes──► fast model
+        │ no
+        ▼
+  classify_prompt(prompt)
+  ┌─────┴──────────────┬──────────────────┐
+  ▼                    ▼                  ▼
+code generation    summarization    Q&A / general
+  │                    │                  │
+fast model         fast model        default model
 ```
 
 <details>

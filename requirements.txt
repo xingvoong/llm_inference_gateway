@@ -3,3 +3,6 @@ uvicorn
 pydantic
 python-dotenv
 requests
+transformers==4.40.0
+torch==2.2.2
+numpy<2
